@@ -1,0 +1,9 @@
+# 目标 API 必须是 101：LSPosed 2.0（lsposed-it-7598 起）已废弃 API 100 模块，
+# targetApiVersion=100 会被判定为「与 API 101 的变更不兼容」而拒绝加载（表现为日志页空白）。
+# API 101 的行为变化只有一条：模块不再注入 zygote、只在作用域进程内加载
+# （scope.list 固定为 com.oplus.keyboard / com.sohu.inputmethod.sogou /
+#  com.baidu.input），对本模块没有影响。
+# 编译期依赖 io.github.libxposed:api:102.0.0，用到的都是 API 101 就有的能力。
+minApiVersion=101
+targetApiVersion=101
+staticScope=true
