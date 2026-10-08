@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 窗口底色：Miuix 自己会画整页背景，但**启动/切换动画那一帧**露出来的是 windowBackground。
+     之前写的是 transparent，动画期间空白区域就透出桌面壁纸了。 -->
+<resources>
+    <color name="window_bg">#FFF6F6F6</color>
+</resources>

@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      Android 11 起「包可见性」默认收紧：不在这里声明，`getPackageInfo` / `getLaunchIntentForPackage`
+      对别的应用一律抛 NameNotFoundException —— 界面就会把装着的输入法全显示成「未安装」。
+    -->
+    <queries>
+        <package android:name="com.oplus.keyboard" />
+        <package android:name="com.sohu.inputmethod.sogou" />
+        <package android:name="com.baidu.input" />
+        <package android:name="org.lsposed.manager" />
+        <package android:name="org.lsposed.manager.it" />
+    </queries>
+
+    <!--
+      模块自己的界面：一个 Activity（用 Compose + Miuix 写），用来
+        · 跳到各输入法里「模块注入了条目」的设置页
+        · 强停输入法（改了模块要重启输入法才生效）
+        · 看每个输入法的注入状态、开关桌面图标
+      LSPosed 识别模块只看 META-INF/xposed/ 下的元数据，不依赖 Activity；
+      但**界面必须在模块自己的进程里**，注入进宿主进程的代码不许引用 androidx。
+    -->
+    <application
+        android:allowBackup="false"
+        android:description="@string/module_description"
+        android:icon="@drawable/ic_module"
+        android:label="@string/app_name"
+        android:supportsRtl="true">
+
+        <!--
+          界面本体：不带 LAUNCHER，桌面图标交给下面的 alias（这样能单独开关图标）。
+
+          ⚠️ 那个 `de.robv.android.xposed.category.MODULE_SETTINGS` **不能删**：
+          LSPosed 管理器里那颗「打开模块」的 FAB 走的是 `AppHelper.getSettingsIntent`，
+          它按这个顺序找 —— ① ACTION_MAIN + 本 category ② ACTION_MAIN + CATEGORY_INFO
+          ③ ACTION_MAIN + CATEGORY_LAUNCHER。以前只挂了 ③（在 alias 上），
+          于是「隐藏桌面图标」一禁用 alias，FAB 就跟着没了。挂上 ① 之后 FAB 与桌面图标彻底解耦。
+          这是 Xposed 生态里的老约定（category 名字是历史遗留的 `de.robv.android.xposed`）。
+        -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.OplusWubi">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="de.robv.android.xposed.category.MODULE_SETTINGS" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          桌面图标就是它。「隐藏桌面图标」开关直接启用/禁用这个 alias
+          （`PackageManager.setComponentEnabledSetting`），Activity 本身不受影响 ——
+          `adb shell am start -n com.lookie.opluswubi/.ui.MainActivity` 仍然能打开界面，
+          LSPosed 里那颗 FAB 也仍然在（见上）。
+        -->
+        <activity-alias
+            android:name=".ui.LauncherAlias"
+            android:exported="true"
+            android:icon="@drawable/ic_module"
+            android:label="@string/app_name"
+            android:targetActivity=".ui.MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+    </application>
+
+</manifest>

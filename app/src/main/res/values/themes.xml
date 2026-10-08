@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  模块自己那个界面用的主题。
+  · 必须 NoActionBar：否则系统会给窗口加一条标题栏，页面上就出现两个「输入法增强」
+    （系统那条 + Miuix 的 SmallTopAppBar）。
+  · windowBackground **不能透明**：启动 / 切换动画那一帧露的就是它，透明会透出桌面壁纸
+    （用户报的「动画播放时空白区域显示成桌面壁纸」就是这个）。跟着深色模式给个纯色即可。
+-->
+<resources>
+    <style name="Theme.OplusWubi" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/window_bg</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

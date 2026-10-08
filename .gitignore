@@ -1,0 +1,21 @@
+*.iml
+.gradle/
+local.properties
+.idea/
+.DS_Store
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.keystore
+*.jks
+# 正式签名的口令文件（本地生成，不入库）
+keystore.properties
+.temp/
+.workbuddy/
+.workbuddy-ai/
+
+# 设备原始包（224MB，只本地留作 dex 核对，不入库）
+reference/*.apk
+reference/__pycache__/
