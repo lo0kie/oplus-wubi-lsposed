@@ -30,6 +30,29 @@ android {
         freeCompilerArgs += listOf("-Xno-param-assertions")
     }
 
+    // 正式签名从**根目录的 `keystore.properties`** 读（该文件不入库，见 .gitignore）：
+    //   storeFile=release.jks
+    //   storePassword=…
+    //   keyAlias=opluswubi
+    //   keyPassword=…
+    // 文件不存在就不创建这个 signingConfig，release 会自动退回 debug 签名。
+    //
+    // ⚠️ 这一段必须排在 `buildTypes` **之前**：下面 `signingConfig = signingConfigs.findByName(...)`
+    // 是配置期立刻求值的，写在 `buildTypes` 后面就永远查不到，release 会静默退回 debug 签名。
+    signingConfigs {
+        val propsFile = rootProject.file("keystore.properties")
+        if (propsFile.exists()) {
+            val props = Properties()
+            propsFile.inputStream().use { props.load(it) }
+            create("release") {
+                storeFile = rootProject.file(props.getProperty("storeFile"))
+                storePassword = props.getProperty("storePassword")
+                keyAlias = props.getProperty("keyAlias")
+                keyPassword = props.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             // 正式版：混淆 + 资源收缩 + 非 debuggable。
@@ -56,26 +79,6 @@ android {
                         "-keyalg RSA -keysize 2048 -validity 10000）",
                 )
                 signingConfigs.getByName("debug")
-            }
-        }
-    }
-
-    signingConfigs {
-        // 正式签名从**根目录的 `keystore.properties`** 读（该文件不入库，见 .gitignore）：
-        //   storeFile=release.jks
-        //   storePassword=…
-        //   keyAlias=opluswubi
-        //   keyPassword=…
-        // 文件不存在就不创建这个 signingConfig，release 会自动退回 debug 签名（见上）。
-        val propsFile = rootProject.file("keystore.properties")
-        if (propsFile.exists()) {
-            val props = Properties()
-            propsFile.inputStream().use { props.load(it) }
-            create("release") {
-                storeFile = rootProject.file(props.getProperty("storeFile"))
-                storePassword = props.getProperty("storePassword")
-                keyAlias = props.getProperty("keyAlias")
-                keyPassword = props.getProperty("keyPassword")
             }
         }
     }
