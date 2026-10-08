@@ -86,3 +86,32 @@ jobs:
           name: oplus-wubi-release-${{ steps.dist.outputs.build_id }}
           path: dist/*-release.apk
           if-no-files-found: error
+
+  release:
+    name: 发布到 Releases
+    needs: build
+    # PR 上的 GITHUB_TOKEN 是只读的，也没必要从 PR 发版
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 建 / 更新 Release
+        uses: softprops/action-gh-release@v3
+        with:
+          # 推 v* 标签就按标签发一版；推分支则滚动更新 `latest`，
+          # 这样仓库首页侧栏始终挂着可直接下载的 APK（README 里那条 Releases 链接才有东西）
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '最新构建' }}
+          make_latest: true
+          files: dist/*.apk
+          body: |
+            由 GitHub Actions 自动构建，含 `-debug` 与 `-release` 两个 APK。
+            版本见文件名里的 `BUILD_ID`（对应 `WubiModule.BUILD_ID`）。
