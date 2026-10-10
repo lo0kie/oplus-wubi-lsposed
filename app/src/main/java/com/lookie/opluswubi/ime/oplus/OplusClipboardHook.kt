@@ -4,6 +4,8 @@ import android.content.res.Resources
 import com.lookie.opluswubi.Reflect
 import com.lookie.opluswubi.XLog
 import com.lookie.opluswubi.hookGuarded
+import com.lookie.opluswubi.ime.ImeEnv
+import com.lookie.opluswubi.table.ModuleConfig
 import io.github.libxposed.api.XposedModule
 
 /**
@@ -77,7 +79,7 @@ internal object OplusClipboardHook {
         }
         module.hookGuarded(invoke) { chain ->
             val case = runCatching { caseField.getInt(chain.getThisObject()) }.getOrDefault(-1)
-            if (case == CASE_OLDEST) {
+            if (case == CASE_OLDEST && clipboardUnlimited()) {
                 if (!logged) {
                     logged = true
                     XLog.i("已解除剪贴板条数上限：跳过「取最旧一条」查询（原本 500 条就删最旧）")
@@ -87,10 +89,16 @@ internal object OplusClipboardHook {
             }
             chain.proceed()
         }
-        XLog.i("已 Hook $CLS_OLDEST_LAMBDA.invoke（剪贴板历史不再按 500 条裁剪）")
+        XLog.i("已 Hook $CLS_OLDEST_LAMBDA.invoke（受「解除剪贴板条数上限」开关控制）")
 
         runCatching { hookLimitText(module) }
             .onFailure { XLog.w("剪贴板面板上限文案改写不可用", it) }
+    }
+
+    /** 读模块设置里的开关；拿不到 Context 时按「开」处理（维持原行为，别无声地把功能关掉）。 */
+    private fun clipboardUnlimited(): Boolean {
+        val ctx = ImeEnv.context() ?: return true
+        return ModuleConfig.clipboardUnlimited(ctx)
     }
 
     /**
@@ -116,6 +124,8 @@ internal object OplusClipboardHook {
         module.hookGuarded(target) { chain ->
             val result = chain.proceed() as? String
             if (result == null || !result.contains("/$DISPLAYED_LIMIT")) return@hookGuarded result
+            // 开关关掉 → 文案保持原样（还是 /500）
+            if (!clipboardUnlimited()) return@hookGuarded result
             val replaced = result.replace("/$DISPLAYED_LIMIT", "/$REAL_LIMIT")
             if (!textLogged) {
                 textLogged = true

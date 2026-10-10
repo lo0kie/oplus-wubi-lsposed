@@ -47,7 +47,7 @@ class WubiModule : XposedModule() {
      * 反复来回。有一行自证的版本号，这类问题一眼就能定。
      */
     private companion object {
-        const val BUILD_ID = "2026-10-09-0115"
+        const val BUILD_ID = "2026-10-10-1545"
     }
 
     /**

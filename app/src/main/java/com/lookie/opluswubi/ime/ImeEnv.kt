@@ -68,6 +68,10 @@ object ImeEnv {
 
     fun bindContext(context: Context) {
         appContext = context.applicationContext ?: context
+        // 拿到 Context 就把「配置同步轮询」拉起来（幂等）。
+        // ⚠️ 必须在这里起、而不是在某个功能的热路径里 —— 见 ModuleConfig.startPolling 的注释：
+        // 只在「功能被用到」时同步，会让「改完开关不生效」看起来像模块坏了（2026-10-10 真机）。
+        runCatching { com.lookie.opluswubi.table.ModuleConfig.startPolling(this.appContext!!) }
     }
 
     /** 适配器注册「实在抓不到 Context 时怎么兜底」——不同输入法的全局 Context 提供者不一样。 */
@@ -84,7 +88,7 @@ object ImeEnv {
     fun context(): Context? {
         appContext?.let { return it }
         val ctx = runCatching { contextProvider?.invoke() }.getOrNull() ?: return null
-        appContext = ctx
+        bindContext(ctx)
         return ctx
     }
 }

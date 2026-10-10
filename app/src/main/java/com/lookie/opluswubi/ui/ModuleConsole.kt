@@ -6,6 +6,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import com.lookie.opluswubi.DEBUG_BUILD
 import com.lookie.opluswubi.XLog
+import com.lookie.opluswubi.table.ModuleConfig
+import com.lookie.opluswubi.table.ModuleSettingsProvider
 import java.util.Locale
 
 /**
@@ -212,7 +214,7 @@ object ModuleConsole {
      */
     fun restartAll(context: Context): String {
         val targets = IMES.filter { installed(context, it.pkg) }
-        if (targets.isEmpty()) return "没有已安装的输入法"
+        if (targets.isEmpty()) return "未安装输入法"
 
         // 一条 su 里跑完：每个包后面跟一句 echo 把「这个包停成功了」带出来，好数个数
         val script = targets.joinToString("; ") {
@@ -222,8 +224,8 @@ object ModuleConsole {
         if (!r.started) {
             // 设备没 root / 模块没被授权时 `su` 这个可执行文件压根不存在，拿到的是
             // `IOException: Cannot run program "su": error=2` —— 那是给排查用的，不是给用户看的
-            XLog.w("强停失败：找不到 su（${r.output}）")
-            return "没有 root"
+            XLog.w("强停失败：su 起不来（${r.output}）")
+            return suUnavailableReason(r.output)
         }
         val stopped = r.output.lineSequence()
             .filter { it.endsWith("]=ok") }
@@ -234,29 +236,56 @@ object ModuleConsole {
             // su 起来了却一个都没停掉：基本都是授权被拒（su 立刻退出并回 Permission denied）。
             // 具体输出仍原样进日志，别只说一句「失败」
             XLog.w("强停失败：exit=${r.exitCode}，输出=${r.output}")
-            return "没有 root 授权"
+            return suUnavailableReason(r.output)
         }
         if (failed.isEmpty()) {
             XLog.i("已强停 ${stopped.size} 个输入法：$stopped")
-            return "已强停 ${stopped.size} 个输入法"
+            return "已重载"
         }
+        // toast 只说「不全成功」，具体哪几家没停掉进日志
         XLog.w("强停不完整：成功 $stopped / 失败 $failed（exit=${r.exitCode}；输出=${r.output}）")
-        // 报给用户的是输入法名字，不是包名 —— `com.baidu.input` 对他没有意义
-        val failedNames = targets.filter { it.pkg in failed }.joinToString("、") { it.name }
-        return "已强停 ${stopped.size}/${targets.size} 个（没停掉：$failedNames）"
+        return "部分输入法未重载"
     }
 
     /** 一条 root 命令的结果。[started] 为 false 表示 `su` 压根起不来（没 root / 没授权）。 */
     private class SuResult(val started: Boolean, val exitCode: Int, val output: String)
 
     /**
+     * 设备上 `su` 可执行文件的位置，**按优先级逐个试**。
+     *
+     * ⚠️ 不能只写 `"su"` 让系统走 PATH —— 应用进程的环境变量是 zygote 那套，
+     * PATH 里**没有** `/system/bin`（真机实测：`IOException: Cannot run program "su": error=2`），
+     * 而设备上 KernelSU 的 su 恰恰就在 `/system/bin/su`。所以先试绝对路径，再退回 `"su"`。
+     */
+    private val SU_PATHS = listOf("/system/bin/su", "/system/xbin/su", "/sbin/su", "su")
+
+    /**
      * 跑 `su -c <script>`。**阻塞**，只能在后台线程调。
      *
-     * `su` 不存在（设备没 root / 模块没被授权）时抛 IOException —— 这里收成 `started=false`
-     * 并把原因放进 [SuResult.output]，让调用方如实回报而不是假装停掉了。
+     * `su` 不存在（设备没 root / 模块没被授权）时抛 IOException —— 这里把所有候选路径都试完，
+     * 收成 `started=false` 并把原因放进 [SuResult.output]，让调用方如实回报而不是假装成功了。
+     *
+     * ⚠️ 权限管理器（KernelSU / Magisk）对**未授权**的应用会把 `su` 从它的 mount namespace 里
+     * 隐藏掉，于是 `execve` 直接回 `ENOENT`（表现为 `error=2`）—— 看起来像"设备没 root"，
+     * 实际是"没给这个应用授权"。所以 [suUnavailableReason] 会把这种情形翻成人话。
      */
-    private fun su(script: String, timeoutMs: Long = 20_000): SuResult = runCatching {
-        val p = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+    private fun su(script: String, timeoutMs: Long = 20_000): SuResult {
+        var lastError = "没有可用的 su"
+        for (path in SU_PATHS) {
+            val result = runCatching { runSu(path, script, timeoutMs) }
+                .getOrElse { e ->
+                    // 这个路径不存在（或起不来）→ 记下原因，试下一个
+                    lastError = "$path: $e"
+                    null
+                }
+            if (result != null) return result
+        }
+        return SuResult(false, -1, lastError)
+    }
+
+    /** 用指定的 su 可执行文件跑一条命令。抛异常 = 这个路径不可用（调用方会试下一个）。 */
+    private fun runSu(path: String, script: String, timeoutMs: Long): SuResult {
+        val p = ProcessBuilder(path, "-c", script).redirectErrorStream(true).start()
         p.outputStream.close()
         // 输出必须在另一个线程里排空，否则缓冲区满了子进程会卡住（`su` 的输出量不小）
         val sb = StringBuilder()
@@ -271,11 +300,69 @@ object ModuleConsole {
         drain.start()
         if (!p.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)) {
             p.destroyForcibly()
-            return@runCatching SuResult(true, -1, "超时 ${timeoutMs}ms")
+            return SuResult(true, -1, "超时 ${timeoutMs}ms")
         }
         drain.join(500)
-        SuResult(true, p.exitValue(), synchronized(sb) { sb.toString().trim() })
-    }.getOrElse { SuResult(false, -1, it.toString()) }
+        return SuResult(true, p.exitValue(), synchronized(sb) { sb.toString().trim() })
+    }
+
+    /**
+     * `su` 起不来时给用户看的一句话。
+     *
+     * 三种情况分开说，因为**用户要做的事完全不同**：
+     *  - `ENOENT`（`error=2`）→ 设备有 root，但没给本模块授权（KernelSU/Magisk 会把未授权应用的
+     *    `su` 藏起来，表现就是"文件不存在"）；
+     *  - `EACCES` / `Permission denied` → 授权了但被拒了；
+     *  - 其它 → 原样带上，便于排查。
+     */
+    private fun suUnavailableReason(output: String): String = when {
+        output.contains("error=2") || output.contains("No such file or directory") ->
+            "未授权 root"
+        output.contains("Permission denied", ignoreCase = true) ||
+            output.contains("error=13") ->
+            "root 授权被拒绝"
+        else -> "拿不到 root"
+    }
+
+    // ---------------------------------------------------------------- 配置开关（走 ContentProvider）
+
+    /**
+     * 读「解除剪贴板条数上限」的当前值。
+     *
+     * ## 为什么不再读输入法的私有目录（2026-10-10 改）
+     *
+     * 原先要 `su` 去 `grep` 各输入法 `filesDir` 下的 `config.properties`（模块进程进不去那些目录），
+     * 于是这个纯本地开关被 root 绑住，还要处理「KernelSU 把未授权应用的 su 藏起来」。
+     * 现在真值在**模块自己**的 [ModuleSettingsProvider] 里，普通 `ContentResolver.query()` 就行。
+     *
+     * 返回 `null` = **真值不可用**（provider 不存在 / 查失败）。这时界面**不该瞎猜**：
+     * 调用方保持当前显示值不动 —— 猜「开」会在用户刚关掉时把开关弹回「开」。
+     *
+     * 不阻塞，但仍建议放后台线程调（跨进程查询，别占主线程）。
+     */
+    fun clipboardUnlimited(context: Context): Boolean? = runCatching {
+        context.contentResolver.query(
+            ModuleSettingsProvider.CONTENT_URI,
+            arrayOf(ModuleConfig.KEY_CLIPBOARD_UNLIMITED),
+            null,
+            null,
+            null,
+        )?.use { c -> if (c.moveToFirst()) c.getString(1) else null }
+    }.getOrNull()?.let { it == "true" || it == "1" }
+
+    /**
+     * 写「解除剪贴板条数上限」。
+     *
+     * 写进模块自己的 provider（**不需要 root，也不走 Binder** —— 界面与 provider 同进程，
+     * 直接调 [ModuleSettingsProvider.write]）。注入侧会在 2 秒内把新值抄回本地
+     * `config.properties`（见 `ModuleConfig.sync`），所以改完**不用重启输入法**，
+     * 切一下键盘 / 再打一次字就生效。
+     */
+    fun setClipboardUnlimited(context: Context, value: Boolean): String {
+        ModuleSettingsProvider.write(context, ModuleConfig.KEY_CLIPBOARD_UNLIMITED, value)
+        val now = clipboardUnlimited(context)
+        return if (now == value) "已生效" else "写入失败"
+    }
 
     // ---------------------------------------------------------------- 桌面图标
 

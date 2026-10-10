@@ -496,15 +496,20 @@ ImePreference.<init>(Context…)
 
 ---
 
-## 剪贴板历史条数上限（四个输入法，2026-10-07）
+## 剪贴板历史条数上限（三个输入法，2026-10-07）
 
-四个输入法的上限各自藏在不同层，找法和改法都不一样。
+三家的上限各自藏在不同层，找法和改法都不一样。
 
 | 输入法 | 上限 | 位置                                                                                                           | 改法                                                                              |
 | ------ | ---- | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
 | 小布   | 500  | `com.oplus.keyboard.db.dao.k`（Room 合成 lambda）case 2 的 `count() == 500`                                    | 挂「取最旧一条」查询 `db.dao.m` 的 case 1 让它返回 null；**面板文案**另改（见下） |
 | 百度   | 300  | `ClipboardConfig.c()` **读偏好表** `clipboard.config.max_query_count`；界面也读它                              | getter 返回 100000 **且**把偏好表写成 100000                                      |
-| 搜狗   | 500  | `com.sogou.clipboard.repository.manager.a.c()`（KV `clipboard_settings_mmkv` 的 `clipboard_max_item_count`）   | 挂 getter，返回 100000                                                            |
+| 搜狗   | **1000** | `com.sogou.clipboard.repository.manager.a.c()`（KV `clipboard_settings_mmkv` 的 `clipboard_max_item_count`）   | 挂 getter，返回 100000                                                            |
+
+> ⚠️ 搜狗这一行 **2026-10-10 真机更正**：早先按反编译的默认值记成 500 是**错的**，
+> 真机日志是 `已解除剪贴板条数上限：a.c() 由 1000 改为 100000` —— 默认上限是 **1000**。
+> （该 getter 读 KV，而 KV 缺键时的默认值来自别处，静态反编译看不出真实默认值。）
+> **教训：上限这类"默认值"必须看真机日志里 Hook 拿到的原始返回值，不能靠反编译猜。**
 
 ⚠️ **界面显示的值和「裁剪用的值」可能不是同一个来源，改之前先确认**（用户要求界面显示真实上限 100000）：
 
@@ -555,6 +560,54 @@ tvCount.setText(context.getString(R.string.clip_length, 当前条数, 500));
 `ClipboardManager`（混淆名 `i`）里那串 `new C0323m0(20, 0, 20, 50, false)` 看着像 `PagingConfig(…, maxSize = 50)`，其实
 `androidx.paging.m0` 的构造里 `maxSize` 写死 `Integer.MAX_VALUE`，那个 `50`
 是 Kotlin 默认参数的**掩码位**。按「分页上限」去改会白改一轮 —— 真正的裁剪在 DB 层。
+
+### ⚠️ 上限开关怎么从模块界面传到注入侧（2026-10-10 改定）
+
+上限是**运行时开关**（用户能在模块界面开/关），所以注入侧的 Hook 必须**常驻**、每次调用读一次配置；
+配置的真值源在模块界面那个进程，注入侧在输入法进程 —— 这是本模块唯一一处跨进程配置通道，
+2026-10-10 因为「改完开关不生效」重做了一遍，现在的定案是**广播推送为主 + provider 轮询兜底**。
+
+为什么不能只靠 `ContentProvider`（走过一次完整的弯路）：
+
+1. **同步起点不能挂在功能热路径上**。早先只在「功能被用到」时才 `sync()`（小布=插剪贴板、搜狗=候选重排），
+   用户改完开关不打字就永远同步不过去 —— 看着就是「改了不生效」。
+   现在同步起点在 `ImeEnv.bindContext()`（拿到宿主 Context 就起，幂等），不依赖任何功能被用到。
+2. **跨应用 `ContentProvider` 会被包可见性挡住**。调用方（输入法）manifest 里没有
+   `<queries><provider android:authorities="com.lookie.opluswubi.settings"/></queries>`，
+   `query()` 返回 null。真机日志：
+
+   ```
+   E ActivityThread: Failed to find provider info for com.lookie.opluswubi.settings
+   ```
+
+   **注意是「找不到 provider」而不是「权限拒绝」** —— 极具误导性（像极了"模块没装"）。
+   规律：模块界面热着时能查到，**冷启动一律 null**，所以时有时无、最难查。
+   而目标输入法的 manifest 我们改不了，`<queries>` 这条路走不通。
+
+于是主通道改成**广播**：`Intent(ACTION).setPackage(输入法包名)`。
+**`setPackage()` 显式指定包名即可投递，不受包可见性限制**（这是关键）。
+接收方注册必须用 **`Context.RECEIVER_EXPORTED`** —— 发送方是另一个 UID，
+标 `NOT_EXPORTED` 只收本应用广播、**静默失败且不报错**，极隐蔽（本节上面「界面不再有已生效」里
+记过一次同样的坑）。
+
+两条通道的分工与纪律：
+
+- **广播（主）**：即时，改完 1 秒内生效；
+- **provider 轮询（兜底）**：每 5 秒一次，覆盖「推送时输入法进程没起」；
+- ⚠️ **兜底通道读不到值时（`remote == null`）绝不写本地** —— 轮询会周期性返回 null
+  （见上），把 null 当"值变了"会把本地好值写坏。这是刻意设计，不是遗漏。
+- 同步留痕**无条件打**：`配置同步[启动/轮询/手动]：provider=… 本地=… 待更新=…`。
+  只有"成功才打"会让失败路径一个字都不留，日志看起来像"函数没被调用"（这条教训踩过两次）。
+
+### 已知缺口：OEM 变体包名没纳入
+
+小布 / 搜狗 / 百度在 ColorOS 上还各有一个 OEM 变体包（`com.oplus.keyboard` 之外的
+`com.sohu.inputmethod.sogouoem`、`com.baidu.input_oppo`）—— 它们**同时装着**，但
+`ImeRegistry` 只登记了主包名，`ModuleSettingsBus` 的推送目标列表也只写了三个主包名。
+（另有 `com.oplus.keyboard` 只在部分机型存在，主测机 `1b1ef3c8` 上根本没有。）
+
+影响：如果用户实际启用的是 OEM 变体，开关改了不会推过去（但 provider 轮询兜底仍能生效）。
+**没做**的原因是没有需求驱动 —— 等真有人在这类变体上复现再说，别提前加。
 
 ## 模块自己的界面（`ui/MainActivity`）
 

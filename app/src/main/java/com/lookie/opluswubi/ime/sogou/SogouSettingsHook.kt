@@ -19,24 +19,42 @@ import java.lang.reflect.Method
  *
  * ## 注入成什么样子
  *
- * 五笔设置页（`WubiSettingFragment`，资源 `r/ai/aw.xml`）原生结构：
+ * 「支持简词」开关注入在**「自定义五笔方案」页**（`WubiPlanCustomFragment`，
+ * 资源 `r/ai/au.xml`）的末尾。
+ *
+ * 迁移路径：五笔设置页「特殊习惯」分组 → 「管理五笔方案」页末尾 → **本页末尾**。
+ * 一步步往「自定义方案」这个概念里收：简词是给自定义方案用的开关，
+ * 就该长在自定义方案的设置页里。
+ *
+ * ## 不需要门槛，也不需要动态显隐
+ *
+ * 这一页**本身就是「自定义五笔方案」**——能被打开就说明用户已经在用它了
+ * （管理页那条在 `d.g() == 0` 时根本点不进来）。所以：
+ * - 不再判定「是否启用自定义方案」，进页面就注入；
+ * - 也不再 Hook 方案切换 —— 本页切方案一/二/三**不改变「是不是自定义方案」**，
+ *   开关本来就该一直在，没有需要显隐的时机。
+ *
+ * 页面结构（`WubiPlanCustomFragment`，资源 `r/ai/au.xml`）：
  * ```
  * PreferenceScreen
- * ├─ SogouCategory「基本设置」
- * │   ├─ SogouSwitchPreference  wubi_hybird_input_enabled        五笔拼音混输
- * │   └─ SogouPreference        wubi_setting_plan_manager        管理五笔方案
+ * ├─ SogouTipRadioButtonPreference  wubi_input_custom_plan1        方案一
+ * ├─ SogouTipRadioButtonPreference  wubi_input_custom_plan2        方案二（未导入时隐藏）
+ * ├─ SogouTipRadioButtonPreference  wubi_input_custom_plan3        方案三（未导入时隐藏）
+ * ├─ SogouClickLightPreference      wubi_input_add_custom_plan     导入自定义五笔方案
  * ├─ SogouDividerPreference
- * ├─ SogouCategory「候选排序」
- * │   ├─ wubi_setting_user_dict / wubi_setting_smart_make_word / wubi_setting_dynamic_fm
- * ├─ SogouDividerPreference
- * ├─ SogouCategory「特殊习惯」
- * │   ├─ wubi_show_code_enabled            编码逐键提示
- * │   ├─ wubi_input_pinyin_show_code       拼音提示五笔编码
- * │   ├─ wubi_input_four_code_commit       四码唯一时自动上屏
- * │   ├─ wubi_input_five_code_commit_first 第五码将首选上屏
- * │   ├─ wubi_setting_z_wildcard           Z键作为五笔通配按键
- * │   └─ ★ 支持简词（本模块注入）★          ← 追加在「特殊习惯」末尾
+ * └─ SogouSwitchPreference          wubi_input_custom_with_system  兼用系统词库 ← 原生最后一条
+ *     ★ 支持简词（本模块注入，追加在本页末尾）★
  * ```
+ * 顶层就是 `PreferenceScreen`（不像管理页多包了一层 category），
+ * 所以直接追加到 `getPreferenceScreen()` 末尾即可。
+ *
+ * 宿主：管理页点「自定义五笔方案」→ `WubiPlanManagerFragment$d.onPreferenceChange`
+ * → `startActivityForResult(WubiPlanManagerSettings)` → `WubiPlanCustomSettings`
+ * （Activity，`Z()` 里 new 出本 Fragment 并塞进参数，见其 `mI` 字段）。
+ *
+ * 相关字段（本页 `X()` / `n0()` / `m0()` 在用，我们**不**依赖）：
+ * - `d.m()` → `pref_wubi_custom_dict_type`（单选勾哪个子方案，`m0()` 用）
+ * - `d.g()` → `pref_wubi_custom_dict_has_imported_count`（导入数，`n0()` 用）
  *
  * ## 实现要点
  *
@@ -46,7 +64,7 @@ import java.lang.reflect.Method
  * 2. 开关**克隆搜狗自己的** `com.sogou.lib.preference.SogouSwitchPreference`，
  *    样式/动画与原生条目完全一致。
  * 3. 开关值不写进搜狗的偏好体系（`setPersistent(false)`），改存模块自己的
- *    `SharedPreferences`（同进程、同私有目录），避免污染搜狗的设置项、也避免被
+ *    `ModuleConfig`（同进程、同私有目录），避免污染搜狗的设置项、也避免被
  *    搜狗自己的 `PreferenceDataStore` 覆盖。
  * 4. 取值靠 Hook `TwoStatePreference.setChecked(boolean)`：用户点开关时 androidx
  *    一定会走到这里（`TwoStatePreference.onClick` / SwitchCompat 的
@@ -74,17 +92,30 @@ internal object SogouSettingsHook {
      */
     private const val SOGOU_FRAGMENT_BASE = "com.sogou.lib.preference.base.AbstractSogouPreferenceFragment"
 
-    /** 五笔设置页。 */
-    private const val WUBI_FRAGMENT = "com.sogou.imskit.feature.settings.preference.WubiSettingFragment"
+    /** 「自定义五笔方案」页 —— 「支持简词」注入在这里。 */
+    private const val WUBI_PLAN_CUSTOM_FRAGMENT =
+        "com.sogou.imskit.feature.settings.preference.WubiPlanCustomFragment"
 
     /** 搜狗自己的开关控件（继承 SwitchPreferenceCompat）。 */
     private const val SOGOU_SWITCH = "com.sogou.lib.preference.SogouSwitchPreference"
 
-    /** 锚点：五笔设置页「特殊习惯」分组里的最后一条（Z键作为五笔通配按键）。 */
-    private const val ANCHOR_Z_WILDCARD = "wubi_setting_z_wildcard"
-
-    /** 兜底锚点：五笔设置页「基本设置」分组里的方案管理。 */
-    private const val ANCHOR_PLAN_MANAGER = "wubi_setting_plan_manager"
+    /**
+     * 自定义方案页最后一条的 key（`r/ai/au.xml`）—— 兜底注入点用它触发。
+     *
+     * 页面结构（`WubiPlanCustomFragment`，资源 `r/ai/au.xml`）：
+     * ```
+     * PreferenceScreen
+     * ├─ SogouTipRadioButtonPreference  wubi_input_custom_plan1
+     * ├─ SogouTipRadioButtonPreference  wubi_input_custom_plan2
+     * ├─ SogouTipRadioButtonPreference  wubi_input_custom_plan3
+     * ├─ SogouClickLightPreference      wubi_input_add_custom_plan
+     * ├─ SogouDividerPreference         （无 key）
+     * └─ SogouSwitchPreference          wubi_input_custom_with_system  ← 最后一条
+     * ```
+     * `wubi_input_custom_with_system`（「兼用系统词库」）是 XML 里最后一条带 key 的条目，
+     * 用它当锚点能保证我们追加时页面已填完（不会中途 append 被后续条目顶到前面）。
+     */
+    private const val ANCHOR_LAST_KEY = "wubi_input_custom_with_system"
 
     /** 我们注入的开关 key。 */
     const val KEY_SIMPLE_WORD = "wubi_setting_simple_word"
@@ -164,7 +195,7 @@ internal object SogouSettingsHook {
             module.hookGuarded(onCreatePreferences) { chain ->
                 val result = chain.proceed()
                 val fragment = chain.getThisObject()
-                if (isWubiFragment(fragment)) {
+                if (isCustomPlanFragment(fragment)) {
                     runCatching { inject(fragment, "onCreatePreferences") }
                         .onFailure { XLog.w("注入「$TITLE_SIMPLE_WORD」失败", it) }
                 }
@@ -185,7 +216,7 @@ internal object SogouSettingsHook {
             module.hookGuarded(onViewCreated) { chain ->
                 val result = chain.proceed()
                 val fragment = chain.getThisObject()
-                if (isWubiFragment(fragment)) {
+                if (isCustomPlanFragment(fragment)) {
                     runCatching { inject(fragment, "onViewCreated") }
                         .onFailure { XLog.w("注入「$TITLE_SIMPLE_WORD」失败", it) }
                 }
@@ -206,17 +237,25 @@ internal object SogouSettingsHook {
             val result = chain.proceed()
             val child = chain.getArg(0)
             val key = keyOf(child)
-            // 只认「特殊习惯」的最后一条：早于它触发时锚点还没加载完，
-            // 会退到别的分组，导致条目先出现在错误的位置再被搬走（会闪）。
-            if (key == ANCHOR_Z_WILDCARD) {
-                // XML 里的子条目是逐个 addPreference 进去的，等这一轮加完再注入，
-                // 这样我们的开关才会稳定排在分组末尾
-                val parent = Reflect.call(child, api?.getParent)
+            // 只认自定义方案页**最后一条**（`r/ai/au.xml` 里的
+            // `wubi_input_custom_with_system`「兼用系统词库」）：更早触发时页面还没填完，
+            // append 进去会被后续 addPreference 顶到前面去（位置会跳）。
+            if (key == ANCHOR_LAST_KEY) {
+                // ⚠️ 这里必须走 `inject()`（它统一做「是否自定义方案」门槛 + 取顶层
+                // `getPreferenceScreen()` 追加），**不能**直接 `injectInto(child.getParent())`：
+                //  - `child` 未必在顶层 `PreferenceScreen` 上，`getParent()` 拿到内层分组时
+                //    插进去会落在那条分组里面而不是页面末尾；
+                //  - 绕开 `inject()` 就绕开了门槛，内置方案下也会被注入（2026-10-10 真机踩过）。
+                // Fragment 实例拿不到（`Preference.getFragment()` 只给类名字符串），但生命周期
+                // 注入点已经把当前 Fragment 存进 `fragmentRef` 了 —— 本页 XML 加载完毕才会
+                // 走到这里的 `ANCHOR_LAST_KEY`，所以那时 `fragmentRef` 一定是本页的 Fragment。
                 main.postDelayed({
-                    if (parent != null && isGroup(parent)) {
-                        runCatching { injectInto(parent, "addPreference") }
-                            .onFailure { e -> XLog.w("兜底注入失败", e) }
+                    val fragment = fragmentRef?.get() ?: run {
+                        XLog.w("[addPreference] fragmentRef 为空，跳过本次兜底注入")
+                        return@postDelayed
                     }
+                    runCatching { inject(fragment, "addPreference") }
+                        .onFailure { e -> XLog.w("兜底注入失败", e) }
                 }, 200)
             }
             result
@@ -251,17 +290,21 @@ internal object SogouSettingsHook {
 
     private fun inject(fragment: Any?, from: String) {
         if (fragment == null) return
+        // 兜底注入点可能被别的设置页触发，这里再确认一次页面类型
+        if (!isCustomPlanFragment(fragment)) return
+
         if (fragmentRef?.get() !== fragment) fragmentRef = WeakReference(fragment)
 
         val screen = Reflect.call(fragment, "getPreferenceScreen") ?: run {
             XLog.w("[$from] getPreferenceScreen() 返回空，跳过本次注入")
             return
         }
-        val group = anchorGroup(screen) ?: run {
-            XLog.w("[$from] 没找到锚点分组，跳过本次注入")
+        if (!isGroup(screen)) {
+            XLog.w("[$from] PreferenceScreen 不是分组（${screen.javaClass.name}），跳过本次注入")
             return
         }
-        injectInto(group, from)
+        // 追加到页面末尾：本页顶层就是 PreferenceScreen，直接加在它末尾即可
+        injectInto(screen, from)
     }
 
     private fun injectInto(group: Any, from: String) {
@@ -277,9 +320,8 @@ internal object SogouSettingsHook {
             return
         }
 
-        // 幂等：上一轮注入的那条可能挂在**别的分组**里（XML 是逐条 addPreference 进去的，
-        // 早先触发时锚点还没加载完，会退到「基本设置」；后来再注入就挂到「特殊习惯」了，
-        // 结果页面上出现两条）。所以这里记住「条目 + 它当时所在的分组」，按记录删。
+        // 幂等：上一轮注入的那条可能挂在**别的分组**里（兜底注入点与生命周期注入点
+        // 触发时机不同，parent 可能不一样）。这里记住「条目 + 它当时所在的分组」，按记录删。
         val old = injectedPref
         val oldParent = injectedParent
         if (old != null && oldParent != null) {
@@ -304,30 +346,16 @@ internal object SogouSettingsHook {
         XLog.i("[$from] 已注入「$TITLE_SIMPLE_WORD」开关（当前=$checked，分组=${group.javaClass.simpleName}）")
     }
 
-    /**
-     * 锚点所在的分组。
-     *
-     * 优先「特殊习惯」（Z键通配是它的最后一条，追加进去正好在末尾）；
-     * 该条目在部分版本/机型上可能被隐藏，退到「基本设置」；再退到整个 PreferenceScreen。
-     */
-    private fun anchorGroup(screen: Any): Any? {
-        for (key in listOf(ANCHOR_Z_WILDCARD, ANCHOR_PLAN_MANAGER)) {
-            val anchor = findPreference(screen, key) ?: continue
-            val parent = Reflect.call(anchor, api?.getParent)
-            if (parent != null && isGroup(parent)) return parent
-        }
-        return if (isGroup(screen)) screen else null
-    }
-
     private fun isGroup(obj: Any): Boolean {
         val prefClass = api?.preferenceClass ?: return false
         return Reflect.method(obj.javaClass, "addPreference", prefClass) != null
     }
 
-    private fun isWubiFragment(obj: Any?): Boolean {
+    /** 是否是「自定义五笔方案」页（`WubiPlanCustomFragment`）—— 注入前必须过这一关。 */
+    private fun isCustomPlanFragment(obj: Any?): Boolean {
         var cur: Class<*>? = obj?.javaClass
         while (cur != null && cur != Any::class.java) {
-            if (cur.name == WUBI_FRAGMENT) return true
+            if (cur.name == WUBI_PLAN_CUSTOM_FRAGMENT) return true
             cur = cur.superclass
         }
         return false

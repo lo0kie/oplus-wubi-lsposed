@@ -37,6 +37,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -74,12 +76,21 @@ import top.yukonga.miuix.kmp.theme.ThemeController
  *  - 顶栏右上角一个刷新图标 = **强停全部已安装的输入法**（让它们重新加载模块）——
  *    走 root，一条 `su -c am force-stop` 搞定（见 [ModuleConsole.restartAll]）；
  *    模块有没有启用改看标题右上角的「未启用」小上标，那条用 **libxposed 官方 API**（见 [LsposedBridge]）；
- *  - 桌面图标可隐藏（开关 alias 组件）。
+ *  - 「功能」分类下是各项能力开关（解除剪贴板条数上限、隐藏桌面图标）。
  */
 class MainActivity : ComponentActivity() {
 
     private var rows by mutableStateOf<List<Row>>(emptyList())
     private var launcherHidden by mutableStateOf(false)
+
+    /**
+     * 「解除剪贴板条数上限」的界面状态。
+     *
+     * ⚠️ 它跟 [launcherHidden] 不一样：那个读本地组件状态就行，这个的真值在**各输入法的私有目录**里
+     * （注入侧读的是那份），模块进程只能 `su` 去读，起手先按「默认开」显示，`onResume` 里用后台线程
+     * 读到真值再刷新。
+     */
+    private var clipboardUnlimited by mutableStateOf(true)
 
     /**
      * 主线程 Handler。
@@ -105,6 +116,7 @@ class MainActivity : ComponentActivity() {
                     version = ModuleConsole.moduleVersion(this),
                     buildKind = ModuleConsole.buildKind(),
                     launcherHidden = launcherHidden,
+                    clipboardUnlimited = clipboardUnlimited,
                     moduleOn = LsposedBridge.enabled,
                     onRestartAll = {
                         // 只做「强停」这一件事：不刷新、不改任何状态。
@@ -117,10 +129,25 @@ class MainActivity : ComponentActivity() {
                     onToggleLauncher = { hide ->
                         if (ModuleConsole.setLauncherHidden(this, hide)) {
                             launcherHidden = ModuleConsole.launcherHidden(this)
-                            toast(if (hide) "桌面图标已隐藏" else "桌面图标已恢复")
+                            toast(if (hide) "已隐藏" else "已恢复")
                         } else {
-                            toast("系统不允许改桌面图标")
+                            toast("改不了桌面图标")
                         }
+                    },
+                    onToggleClipboard = { on ->
+                        // 先把开关按用户点的那个值画出来（点完立刻有反馈），
+                        // 后台 `su` 写文件、回主线程 toast。写失败时【不要】瞎猜真值，
+                        // 让用户点的那个值留在界面上，靠 toast 里那句原因说明没写成功。
+                        clipboardUnlimited = on
+                        Thread {
+                            val msg = ModuleConsole.setClipboardUnlimited(this, on)
+                            val real = ModuleConsole.clipboardUnlimited(this)
+                            main.post {
+                                // 读得到才校正（读不到 = 没 root，保留用户点的值 + 那句 toast）
+                                if (real != null) clipboardUnlimited = real
+                                toast(msg)
+                            }
+                        }.start()
                     },
                     onRefresh = { refresh() },
                 )
@@ -141,6 +168,12 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         launcherHidden = ModuleConsole.launcherHidden(this)
         refresh()
+        // 剪贴板开关的真值在输入法私有目录里，只能 su 读 → 后台线程，读到再回主线程刷界面。
+        // 读不到（没 root）就保持现状不动，别把界面弹成猜的值。
+        Thread {
+            val on = ModuleConsole.clipboardUnlimited(this)
+            if (on != null) main.post { clipboardUnlimited = on }
+        }.start()
     }
 
     private fun toast(msg: String) {
@@ -172,9 +205,11 @@ private fun ConsoleScreen(
     version: String,
     buildKind: String,
     launcherHidden: Boolean,
+    clipboardUnlimited: Boolean,
     moduleOn: Boolean,
     onRestartAll: () -> Unit,
     onToggleLauncher: (Boolean) -> Unit,
+    onToggleClipboard: (Boolean) -> Unit,
     onRefresh: () -> Unit,
 ) {
     // 模块没启用时，整页（含分类标题、关于那一行）一起降亮度 —— 只灰控件、标题还亮着会很割裂
@@ -204,8 +239,17 @@ private fun ConsoleScreen(
             }
 
             Spacer(Modifier.height(8.dp))
-            SmallTitle("桌面图标", textColor = sectionColor)
+            SmallTitle("功能", textColor = sectionColor)
             Card {
+                // 剪贴板条数上限：Hook 是常驻的（装上就卸不掉），开关只决定「放行原值 / 顶成上限」，
+                // 所以在每次调用时读配置 → 改完**不用重启输入法**，切一下键盘就生效。
+                // 配置走 ContentProvider 通道（模块写 / 注入侧读），**不需要 root**。
+                SuperSwitch(
+                    title = "解除剪贴板条数上限",
+                    checked = clipboardUnlimited,
+                    enabled = moduleOn,
+                    onCheckedChange = onToggleClipboard,
+                )
                 SuperSwitch(
                     title = "隐藏桌面图标",
                     checked = launcherHidden,
@@ -287,6 +331,21 @@ private fun ConsoleHeader(moduleOn: Boolean, onRestartAll: () -> Unit) {
     }
 }
 
+/**
+ * 亮度（灰度）权重矩阵，用来把默认图标去饱和 —— 未安装的占位图标靠它 + 低透明度，
+ * 跟真实图标区分开，又不至于花哨。
+ *
+ * ⚠️ 用 Compose 的 `ColorMatrix(FloatArray)` 直接给 20 个分量（4×5），
+ * **不能**用 `android.graphics.ColorMatrix().setSaturation(0f)` —— 那是另一个类，
+ * 两者同名会撞 import（2026-10-10 编译踩过）。
+ */
+private val DESATURATE = floatArrayOf(
+    0.2126f, 0.7152f, 0.0722f, 0f, 0f,
+    0.2126f, 0.7152f, 0.0722f, 0f, 0f,
+    0.2126f, 0.7152f, 0.0722f, 0f, 0f,
+    0f, 0f, 0f, 1f, 0f,
+)
+
 @Composable
 private fun ImeRow(
     row: MainActivity.Row,
@@ -296,7 +355,7 @@ private fun ImeRow(
     val ctx = LocalContext.current
     val main = remember { Handler(Looper.getMainLooper()) }
 
-    // 真实的应用图标（没装就没有）
+    // 真实的应用图标（没装就 null，下面用默认占位图标顶上）
     val icon = remember(row.ime.pkg, row.installed) {
         if (!row.installed) {
             null
@@ -312,23 +371,47 @@ private fun ImeRow(
 
     // 行里只留「装没装」这一件事 —— 模块挂没挂上交给顶栏那一个总指示（见类头注释）
     val status = if (row.installed) null else "未安装"
-    // 模块没启用时整行跟着降亮度：`BasicComponent` 的 enabled 只管它自己画的那部分，
-    // 这里是自定义内容（标题/摘要/状态/箭头都是我们自己画的），得自己按 enabled 挑颜色
+    // 整行「该不该灰」由两件事共同决定：
+    //  - 模块没启用（`enabled == false`）；
+    //  - 这个输入法没装（点了也开不了设置，等于不可用）→ 一样灰掉 + 禁用点击。
+    // 取或：任一成立就降亮度。`BasicComponent` 的 enabled 只管它自己画的那部分，
+    // 标题/摘要/状态/箭头都是我们自己画的，得自己按 `dimmed` 挑颜色。
+    val dimmed = !enabled || !row.installed
     val dim = MiuixTheme.colorScheme.disabledOnSurface
-    val titleColor = if (enabled) MiuixTheme.colorScheme.onBackground else dim
-    val summaryColor = if (enabled) MiuixTheme.colorScheme.onSurfaceVariantSummary else dim
-    val statusColor = if (enabled) MiuixTheme.colorScheme.onSurfaceVariantSummary else dim
+    val titleColor = if (dimmed) dim else MiuixTheme.colorScheme.onBackground
+    val summaryColor =
+        if (dimmed) dim else MiuixTheme.colorScheme.onSurfaceVariantSummary
+    val statusColor =
+        if (dimmed) dim else MiuixTheme.colorScheme.onSurfaceVariantSummary
+    // 未安装的占位图标不受 `enabled` 影响，永远比真图标淡一点
+    val iconAlpha = if (row.installed) 1f else 0.35f
 
     BasicComponent(
-        // 图标右边留 16dp（Miuix 自己的标准间距），跟标题拉开
+        // 图标右边留 16dp（Miuix 自己的标准间距），跟标题拉开。
+        // ⚠️ 未安装时也要占住这 40dp（用默认图标顶替），否则 4 行里那一行的标题会
+        // 少了图标宽度、跟其它行对不齐。
         leftAction = {
-            icon?.let {
-                Box(modifier = Modifier.padding(end = 16.dp)) {
+            Box(modifier = Modifier.padding(end = 16.dp)) {
+                if (icon != null) {
                     Image(
-                        bitmap = it,
+                        bitmap = icon,
                         contentDescription = null,
                         // Fit + 上面裁成的正方形：四家图标都正好铺满这 40dp，不会被拉变形
                         contentScale = ContentScale.Fit,
+                        alpha = iconAlpha,
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(RoundedCornerShape(11.dp)),
+                    )
+                } else {
+                    // 未安装 → 默认图标占位。跟真实图标同一个 40dp 框 + 同一个圆角，
+                    // 只是压低透明度 + 去饱和，一眼能看出是「空缺」而不是真图标。
+                    Image(
+                        painter = painterResource(R.drawable.ic_module),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        alpha = iconAlpha,
+                        colorFilter = ColorFilter.colorMatrix(ColorMatrix(DESATURATE)),
                         modifier = Modifier
                             .size(40.dp)
                             .clip(RoundedCornerShape(11.dp)),
@@ -341,23 +424,23 @@ private fun ImeRow(
             Icon(
                 imageVector = MiuixIcons.Basic.ArrowRight,
                 contentDescription = null,
-                tint = if (enabled) {
-                    MiuixTheme.colorScheme.onSurfaceVariantActions
-                } else {
+                tint = if (dimmed) {
                     dim
+                } else {
+                    MiuixTheme.colorScheme.onSurfaceVariantActions
                 },
                 modifier = Modifier.size(width = 10.dp, height = 16.dp),
             )
         },
         onClick = {
-            if (!enabled) return@BasicComponent
+            if (dimmed) return@BasicComponent
             // `su am start` 是阻塞的，放后台线程。成败都只进日志（不再弹 toast）
             Thread {
                 ModuleConsole.openSettings(ctx, row.ime)
                 main.post { onRefresh() }
             }.start()
         },
-        enabled = enabled,
+        enabled = !dimmed,
     ) {
         Row(verticalAlignment = Alignment.Top) {
             Text(

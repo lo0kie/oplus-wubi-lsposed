@@ -67,6 +67,20 @@
             </intent-filter>
         </activity-alias>
 
+        <!--
+          模块配置的跨应用读取入口（见 ModuleSettingsProvider 的类注释）。
+
+          · `exported=true` 是必须的：注入侧跑在**输入法进程**里，要跨应用 `query()`；
+          · 不声明 `readPermission`：自定义签名级权限要求同一份签名（做不到），
+            而 `normal` 级权限任何应用在 manifest 里声明就拿到 —— 与不声明等同。
+            安全靠「只读白名单键」+「写入只允许模块自己的 uid」来收窄（见 provider 内实现）；
+          · 只暴露三个开关（剪贴板上限 / 支持简词 / 修复五笔方案），码表之类的键一概不给。
+        -->
+        <provider
+            android:name=".table.ModuleSettingsProvider"
+            android:authorities="com.lookie.opluswubi.settings"
+            android:exported="true" />
+
     </application>
 
 </manifest>

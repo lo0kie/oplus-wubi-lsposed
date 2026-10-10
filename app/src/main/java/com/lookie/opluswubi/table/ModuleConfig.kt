@@ -1,6 +1,8 @@
 package com.lookie.opluswubi.table
 
 import android.content.Context
+import android.os.Handler
+import android.os.HandlerThread
 import com.lookie.opluswubi.XLog
 import java.io.File
 
@@ -42,6 +44,14 @@ object ModuleConfig {
      */
     const val KEY_BAIDU_FIX = "baidu_fix_wb_scheme"
 
+    /**
+     * 「解除剪贴板条数上限」（四个输入法通用）。
+     *
+     * 打开时剪贴板历史不再按各家自己的上限（小布 500 / 搜狗 1000 / 百度 300）裁剪；
+     * 关掉就恢复各家原生行为。**默认开**（原来的行为就是一直开，不能因为加了开关就变了默认）。
+     */
+    const val KEY_CLIPBOARD_UNLIMITED = "clipboard_unlimited"
+
     // ---------------------------------------------------------------- 读写
 
     private fun file(context: Context): File = File(TableStore.root(context), FILE_NAME)
@@ -74,18 +84,185 @@ object ModuleConfig {
      *
      * 同样走文件存储：搜狗的设置页与输入法本体虽然同进程，但统一走一套读写实现更省心。
      */
-    fun simpleWord(context: Context): Boolean =
-        getBoolean(context, KEY_SIMPLE_WORD, true)
+    fun simpleWord(context: Context): Boolean {
+        sync(context)
+        return getBoolean(context, KEY_SIMPLE_WORD, true)
+    }
 
     fun setSimpleWord(context: Context, value: Boolean) =
         putBoolean(context, KEY_SIMPLE_WORD, value)
 
     /** 是否自动修复五笔方案，默认开（百度输入法适配用的开关）。 */
-    fun baiduFixEnabled(context: Context): Boolean =
-        getBoolean(context, KEY_BAIDU_FIX, true)
+    fun baiduFixEnabled(context: Context): Boolean {
+        sync(context)
+        return getBoolean(context, KEY_BAIDU_FIX, true)
+    }
 
     fun setBaiduFixEnabled(context: Context, value: Boolean) =
         putBoolean(context, KEY_BAIDU_FIX, value)
+
+    /**
+     * 是否解除剪贴板条数上限，默认开（四个输入法通用）。
+     *
+     * 剪贴板 Hook 是**常驻**的（Hook 一旦卸载不了），由这个开关在每次调用时决定
+     * 「放行原值」还是「顶成上限」。所以改完立刻生效，不需要重启输入法。
+     */
+    fun clipboardUnlimited(context: Context): Boolean {
+        sync(context)
+        return getBoolean(context, KEY_CLIPBOARD_UNLIMITED, true)
+    }
+
+    fun setClipboardUnlimited(context: Context, value: Boolean) =
+        putBoolean(context, KEY_CLIPBOARD_UNLIMITED, value)
+
+    // ---------------------------------------------------------------- 与模块进程同步
+
+    /**
+     * 从**模块进程**（`ModuleSettingsProvider`）把配置抄回本地 `config.properties`。
+     *
+     * ## 为什么需要（2026-10-10）
+     *
+     * 模块界面（`com.lookie.opluswubi` 进程）要改这些开关，而本地配置文件在**输入法自己的
+     * 私有目录**里 —— 模块进程进不去，只能靠 `su`（还依赖设备侧给 root 授权）。
+     * 现在改成：模块把值写进自己的 `ContentProvider`，这里读回来落盘，**完全不需要 root**。
+     *
+     * ## 时序
+     *
+     * 每个读方法（[simpleWord] / [baiduFixEnabled] / [clipboardUnlimited]）开头都调它，
+     * 但它是**节流**的（[SYNC_INTERVAL_MS] 内只查一次 provider），所以热路径上多数时候
+     * 只是比一下时间戳。真正的 `query()` 一次只花几毫秒，且不在 UI 线程。
+     *
+     * 拿不到 provider（模块没装 / 没启用 / 老版本）就**什么都不做**，沿用本地旧值。
+     */
+    @Volatile
+    private var lastSyncAt = 0L
+
+    private fun sync(context: Context) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastSyncAt < SYNC_INTERVAL_MS) return
+        lastSyncAt = now
+        syncNow(context, "节流到期")
+    }
+
+    /**
+     * 立即同步一次（跳过节流）。
+     *
+     * 之所以要有一个「跳过节流」的入口，是因为节流版（[sync]）只在热路径上被调到 ——
+     * 用户在模块界面改完开关、回头一看本地文件还是旧值，看着就像「改了不生效」。
+     * 现在启动 / 轮询 / 收到推送都走这个无节流版，热路径仍走节流版。
+     */
+    fun syncNow(context: Context, reason: String = "手动") {
+        runCatching {
+            val cached = read(context)
+            val changed = mutableMapOf<String, String>()
+            val seen = mutableMapOf<String, String?>()
+            for (key in ModuleSettingsProvider.EXPOSED_KEYS) {
+                val remote = queryRemote(context, key)
+                seen[key] = remote
+                if (remote == null) continue
+                if (cached[key] != remote) changed[key] = remote
+            }
+            // 留痕**无条件**打（成功/无变化/全查不到都看得见）—— 老毛病是「只在成功时打」，
+            // 失败路径一个字都不留，看起来像函数没被调用（2026-10-10 白跑一轮的教训）。
+            XLog.i("配置同步[$reason]：provider=$seen 本地=${cached.toMap()} 待更新=${changed.toMap()}")
+            if (changed.isEmpty()) return@runCatching
+            val map = cached.toMutableMap().apply { putAll(changed) }
+            write(context, map)
+            XLog.i("已从模块同步配置：${changed.keys.sorted()}")
+        }.onFailure { XLog.w("从模块同步配置失败（沿用本地旧值）", it) }
+    }
+
+    /** 向模块的 provider 查一个键；查不到返回 null。 */
+    private fun queryRemote(context: Context, key: String): String? = runCatching {
+        context.contentResolver.query(
+            ModuleSettingsProvider.CONTENT_URI,
+            arrayOf(key),
+            null,
+            null,
+            null,
+        )?.use { c ->
+            if (c.moveToFirst()) c.getString(1) else null
+        }
+    }.onFailure { XLog.w("查模块 provider 失败（key=$key）", it) }.getOrNull()
+
+    // ---------------------------------------------------------------- 常驻同步（2026-10-10）
+
+    /**
+     * 常驻轮询：**不依赖任何功能被用到**，每隔 [POLL_INTERVAL_MS] 拉一次 provider。
+     *
+     * ## 为什么必须常驻（真机踩到）
+     *
+     * 原先只在「读配置的那一刻」顺带同步 —— 而读配置的调用点全在**功能的热路径**上：
+     * 小布是「插一条剪贴板记录」时、搜狗是「候选重排」时。用户在模块界面改完开关，
+     * 如果不巧没有再触发那条路径（小布尤其：改完不看剪贴板就永远不同步），
+     * 本地 `config.properties` 就一直停在旧值 —— 用户看到的就是「改了不生效」。
+     *
+     * 真机证据（PLK110）：provider 里 `clipboard_unlimited=false`（用户在模块界面关掉了），
+     * 而小布/搜狗私有目录里的文件都还是 `clipboard_unlimited=true`，两边对不上。
+     *
+     * 所以改成：适配器装 Hook 时起一个后台线程，**无条件**周期拉取。
+     * 拉取本身是跨进程 `query()`，一次几毫秒，5 秒一次对功耗没有可感知影响。
+     *
+     * ⚠️ 但 `query()` 会被 **Android 11+ 包可见性**挡住（目标输入法 manifest 里没有
+     * `<queries>`，而我们改不了它），真机表现是「找不到 provider」、`query()` 返回 null，
+     * 且**冷启动时几乎必然失败**。所以轮询只是兜底 —— 主通道是 [ModuleSettingsBus] 的广播。
+     */
+    @Volatile
+    private var poller: Handler? = null
+
+    private const val POLL_INTERVAL_MS = 5_000L
+
+    /** 幂等：每个输入法进程只会有一个轮询线程。 */
+    @Synchronized
+    fun startPolling(context: Context) {
+        if (poller != null) return
+        val app = context.applicationContext ?: context
+
+        // 主通道：注册广播接收器，模块界面改开关时直接推过来（不用等轮询）。
+        // 这一步必须在轮询之前 —— 推送是即时的，轮询只是兜底（见 ModuleSettingsBus 注释）。
+        ModuleSettingsBus.registerReceiver(app)
+
+        val thread = HandlerThread("wubi-config-sync").apply { start() }
+        val handler = Handler(thread.looper)
+        poller = handler
+        // 先立刻同步一次（进程刚起来，本地文件可能是上次留下的旧值）
+        syncNow(app, "启动")
+        handler.postDelayed(object : Runnable {
+            override fun run() {
+                syncNow(app, "轮询")
+                handler.postDelayed(this, POLL_INTERVAL_MS)
+            }
+        }, POLL_INTERVAL_MS)
+        XLog.i("配置同步已启动（推送接收器 + 每 ${POLL_INTERVAL_MS}ms 拉一次 provider 兜底）")
+    }
+
+    /**
+     * 收到模块推来的一条配置，直接落盘。
+     *
+     * 不做任何「换算」—— 推送里的值就是模块界面上那个开关的值。
+     * 落盘后 `read()` 的缓存会因为 `write()` 里调的 `invalidate()` 自动失效，
+     * 所以下一次热路径读取立刻是新值（改完**不用重启输入法**）。
+     */
+    fun applyPushed(context: Context, key: String, value: String) {
+        runCatching {
+            val map = read(context).toMutableMap()
+            if (map[key] == value) {
+                XLog.i("配置推送[$key=$value]与本地一致，无需落盘")
+                return@runCatching
+            }
+            map[key] = value
+            write(context, map)
+            XLog.i("已落盘模块推送的配置：$key=$value")
+        }.onFailure { XLog.w("落盘模块推送的配置失败：$key", it) }
+    }
+
+    /**
+     * 两次向 provider 拉取的**最小间隔**。
+     *
+     * 2 秒：比人手点开关的节奏快得多（改完下一次输入就生效），又不会让热路径上
+     * 每个键都去跨进程查一次。
+     */
+    private const val SYNC_INTERVAL_MS = 2_000L
 
     // ---------------------------------------------------------------- 实现
 
